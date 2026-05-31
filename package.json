@@ -1,0 +1,92 @@
+{
+  "name": "@xyph3r/idempotency",
+  "version": "0.1.0",
+  "description": "Framework-agnostic idempotency for HTTP handlers and event consumers.",
+  "author": "xyph3r",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "packageManager": "npm@10.8.2",
+  "files": [
+    "dist"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./adapters/express": {
+      "types": "./dist/adapters/express.d.ts",
+      "import": "./dist/adapters/express.js"
+    },
+    "./adapters/fastify": {
+      "types": "./dist/adapters/fastify.d.ts",
+      "import": "./dist/adapters/fastify.js"
+    },
+    "./adapters/fetch": {
+      "types": "./dist/adapters/fetch.d.ts",
+      "import": "./dist/adapters/fetch.js"
+    },
+    "./adapters/hono": {
+      "types": "./dist/adapters/hono.d.ts",
+      "import": "./dist/adapters/hono.js"
+    },
+    "./adapters/next": {
+      "types": "./dist/adapters/next.d.ts",
+      "import": "./dist/adapters/next.js"
+    },
+    "./consumer": {
+      "types": "./dist/consumer/create-idempotent-consumer.d.ts",
+      "import": "./dist/consumer/create-idempotent-consumer.js"
+    },
+    "./stores/redis": {
+      "types": "./dist/stores/redis-store.d.ts",
+      "import": "./dist/stores/redis-store.js"
+    },
+    "./stores/memory": {
+      "types": "./dist/stores/memory-store.d.ts",
+      "import": "./dist/stores/memory-store.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/faisalahmedsifat/idempotency.git"
+  },
+  "bugs": {
+    "url": "https://github.com/faisalahmedsifat/idempotency/issues"
+  },
+  "homepage": "https://github.com/faisalahmedsifat/idempotency#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.build.json --noEmit",
+    "test": "bun test test/*.test.ts",
+    "test:node": "rm -rf .test-dist && tsc -p tsconfig.test.json && node --test .test-dist/test/*.test.js",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run test:node"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  },
+  "keywords": [
+    "idempotency",
+    "idempotency-key",
+    "redis",
+    "webhooks",
+    "queue",
+    "consumer",
+    "express",
+    "fastify",
+    "hono",
+    "nextjs",
+    "bun"
+  ]
+}
