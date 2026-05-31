@@ -2,12 +2,29 @@
 
 Framework-agnostic idempotency for Node.js HTTP handlers and event consumers.
 
-The package is built around a few deliberate design choices:
+This package is for operations that must be safe to retry:
 
-- `State`: a key is either `processing` or `completed`
-- `Builder`: readable setup for store, TTLs, and wait policy
-- `Decorator`: adapters wrap handlers without leaking HTTP concerns into the core
-- `Pipeline`: claim, execute, store, and replay happen in a fixed order
+- charging a card
+- creating an order
+- processing a webhook
+- handling a queue message that may be redelivered
+
+If the same idempotency key is seen twice, the operation runs once and later duplicates get the stored result back.
+
+## When to use it
+
+Use it when:
+
+- a client may retry a `POST`, `PATCH`, or `PUT`
+- a webhook provider may deliver the same event more than once
+- a queue or broker uses at-least-once delivery
+- the handler has side effects you must not apply twice
+
+Do not use it when:
+
+- the route is just a `GET` or another pure read
+- the operation is already naturally idempotent and duplicate execution is harmless
+- you do not have a stable key from the caller or event source
 
 ## Install
 
@@ -15,65 +32,29 @@ The package is built around a few deliberate design choices:
 npm install @xyph3r/idempotency
 ```
 
-## Quick start
+or
 
-```ts
-import express from "express";
-import {
-  IdempotencyBuilder,
-  createExpressIdempotency,
-} from "@xyph3r/idempotency";
-
-const app = express();
-
-const idempotency = new IdempotencyBuilder()
-  .withMemoryStore()
-  .withTTL(24 * 60 * 60 * 1_000)
-  .build();
-
-app.post(
-  "/payments",
-  createExpressIdempotency(
-    idempotency,
-    async (_request, response) => {
-      response.status(201);
-      response.json?.({ ok: true });
-    },
-    {
-      key: (request) => request.headers["idempotency-key"] as string | undefined,
-    },
-  ),
-);
+```bash
+bun add @xyph3r/idempotency
 ```
 
-The first request executes normally. A retry with the same key replays the original response body, status code, and headers without running the handler again.
+## How it works
 
-## Core usage
+For a given key, the package stores one of two states:
 
-```ts
-import { IdempotencyBuilder } from "@xyph3r/idempotency";
+- `processing`: one request is currently executing
+- `completed`: the original result is already stored and can be replayed
 
-const idempotency = new IdempotencyBuilder()
-  .withMemoryStore()
-  .withTTL(60_000)
-  .build();
+The normal flow is:
 
-const first = await idempotency.execute("payment:123", async () => {
-  return { charged: true };
-});
+1. claim the key
+2. run the operation once
+3. store the result
+4. replay the stored result for duplicates
 
-const second = await idempotency.execute("payment:123", async () => {
-  return { charged: false };
-});
+## Production setup
 
-console.log(first.status); // "executed"
-console.log(second.status); // "replayed"
-console.log(second.value); // { charged: true }
-```
-
-## Redis-backed usage
-
-The package does not force a Redis client. It ships executors for the common `node-redis` and `ioredis` interfaces.
+Use Redis in production. `MemoryStore` is for local development and tests.
 
 ### `node-redis`
 
@@ -85,14 +66,14 @@ import {
   createNodeRedisExecutor,
 } from "@xyph3r/idempotency";
 
-const client = createClient();
+const client = createClient({ url: process.env.REDIS_URL });
 await client.connect();
 
-const store = new RedisStore(createNodeRedisExecutor(client));
-
-const idempotency = new IdempotencyBuilder()
-  .useStore(store)
+export const idempotency = new IdempotencyBuilder()
+  .useStore(new RedisStore(createNodeRedisExecutor(client)))
   .withTTL(24 * 60 * 60 * 1_000)
+  .withProcessingTTL(30_000)
+  .withPollInterval(50)
   .build();
 ```
 
@@ -107,10 +88,128 @@ import {
 } from "@xyph3r/idempotency";
 
 const client = new Redis(process.env.REDIS_URL!);
-const store = new RedisStore(createIORedisExecutor(client));
+
+export const idempotency = new IdempotencyBuilder()
+  .useStore(new RedisStore(createIORedisExecutor(client)))
+  .withTTL(24 * 60 * 60 * 1_000)
+  .build();
 ```
 
-## Fetch and Next.js
+## HTTP usage
+
+For HTTP, the best pattern is:
+
+- protect only side-effecting routes
+- require the caller to send a stable idempotency key
+- wrap the actual route handler, not a global middleware chain
+
+The adapters default to `POST`, `PATCH`, and `PUT`.
+
+### Express
+
+`createExpressIdempotency()` wraps the route handler directly.
+
+```ts
+import express from "express";
+import {
+  IdempotencyBuilder,
+  createExpressIdempotency,
+} from "@xyph3r/idempotency";
+
+const app = express();
+app.use(express.json());
+
+const idempotency = new IdempotencyBuilder()
+  .withMemoryStore()
+  .withTTL(24 * 60 * 60 * 1_000)
+  .build();
+
+app.post(
+  "/payments",
+  createExpressIdempotency(
+    idempotency,
+    async (request, response) => {
+      const payment = await chargeCard(request.body);
+      response.status(201);
+      response.json?.(payment);
+    },
+    {
+      key: (request) =>
+        request.headers["idempotency-key"] as string | undefined,
+    },
+  ),
+);
+```
+
+Use this for routes like:
+
+- `POST /payments`
+- `POST /orders`
+- `POST /subscriptions/:id/cancel`
+
+### Fastify
+
+Wrap the route handler you register with Fastify.
+
+```ts
+import Fastify from "fastify";
+import {
+  IdempotencyBuilder,
+  createFastifyIdempotency,
+} from "@xyph3r/idempotency";
+
+const app = Fastify();
+
+const idempotency = new IdempotencyBuilder()
+  .withMemoryStore()
+  .withTTL(24 * 60 * 60 * 1_000)
+  .build();
+
+app.post(
+  "/orders",
+  createFastifyIdempotency(
+    idempotency,
+    async (request, reply) => {
+      const order = await createOrder(request.body);
+      reply.code(201);
+      reply.send(order);
+    },
+    {
+      key: (request) =>
+        request.headers["idempotency-key"] as string | undefined,
+    },
+  ),
+);
+```
+
+### Fetch / Bun / standard `Request` handlers
+
+Use `createFetchIdempotency()` when your handler already looks like `(request) => Response`.
+
+```ts
+import {
+  IdempotencyBuilder,
+  createFetchIdempotency,
+} from "@xyph3r/idempotency";
+
+const idempotency = new IdempotencyBuilder()
+  .withMemoryStore()
+  .build();
+
+const handler = createFetchIdempotency(
+  idempotency,
+  async (request) => {
+    const body = await request.json();
+    const payment = await chargeCard(body);
+    return Response.json(payment, { status: 201 });
+  },
+  {
+    key: (request) => request.headers.get("idempotency-key") ?? undefined,
+  },
+);
+```
+
+#### Bun example
 
 ```ts
 import { createFetchIdempotency, IdempotencyBuilder } from "@xyph3r/idempotency";
@@ -119,16 +218,106 @@ const idempotency = new IdempotencyBuilder()
   .withMemoryStore()
   .build();
 
-const handler = createFetchIdempotency(
+Bun.serve({
+  fetch: createFetchIdempotency(
+    idempotency,
+    async (request) => {
+      const body = await request.json();
+      const result = await createCheckout(body);
+      return Response.json(result, { status: 201 });
+    },
+    {
+      key: (request) => request.headers.get("idempotency-key") ?? undefined,
+    },
+  ),
+});
+```
+
+### Hono
+
+Wrap the Hono route handler itself.
+
+```ts
+import { Hono } from "hono";
+import {
+  IdempotencyBuilder,
+  createHonoIdempotency,
+} from "@xyph3r/idempotency";
+
+const app = new Hono();
+
+const idempotency = new IdempotencyBuilder()
+  .withMemoryStore()
+  .build();
+
+app.post(
+  "/payments",
+  createHonoIdempotency(
+    idempotency,
+    async (c) => {
+      const body = await c.req.raw.json();
+      const payment = await chargeCard(body);
+      return c.json(payment, 201);
+    },
+    {
+      key: (c) => c.req.header("idempotency-key"),
+    },
+  ),
+);
+```
+
+### Next.js App Router
+
+Wrap the exported route handler.
+
+```ts
+import {
+  IdempotencyBuilder,
+  createNextIdempotency,
+} from "@xyph3r/idempotency";
+
+const idempotency = new IdempotencyBuilder()
+  .withMemoryStore()
+  .build();
+
+export const POST = createNextIdempotency(
   idempotency,
-  async () => Response.json({ ok: true }, { status: 201 }),
+  async (request) => {
+    const body = await request.json();
+    const order = await createOrder(body);
+    return Response.json(order, { status: 201 });
+  },
   {
-    key: async (request) => request.headers.get("idempotency-key") ?? undefined,
+    key: (request) => request.headers.get("idempotency-key") ?? undefined,
   },
 );
 ```
 
-## Event consumers
+If your key depends on route params:
+
+```ts
+export const POST = createNextIdempotency(
+  idempotency,
+  async (request, context: { params: { orderId: string } }) => {
+    return Response.json({ orderId: context.params.orderId });
+  },
+  {
+    key: (request, context) =>
+      request.headers.get("idempotency-key") ??
+      `${context.params.orderId}:${request.headers.get("x-request-id") ?? ""}`,
+  },
+);
+```
+
+## Event-driven usage
+
+This is where the package becomes especially useful.
+
+At-least-once delivery means duplicate events are normal. Consumers need a stable event key and must be safe to call twice.
+
+### Webhook consumer
+
+Use the provider event ID as the key.
 
 ```ts
 import {
@@ -141,10 +330,12 @@ const idempotency = new IdempotencyBuilder()
   .withTTL(7 * 24 * 60 * 60 * 1_000)
   .build();
 
-const onInvoicePaid = createIdempotentConsumer(
+const handleStripeEvent = createIdempotentConsumer(
   idempotency,
-  async (event: { id: string; invoiceId: string }) => {
-    await markInvoicePaid(event.invoiceId);
+  async (event: { id: string; type: string; data: { object: { invoiceId: string } } }) => {
+    if (event.type === "invoice.paid") {
+      await markInvoicePaid(event.data.object.invoiceId);
+    }
   },
   {
     key: (event) => event.id,
@@ -152,7 +343,112 @@ const onInvoicePaid = createIdempotentConsumer(
 );
 ```
 
-This is the EDA use case: at-least-once delivery means duplicates happen, and the handler should only apply its side effects once.
+### Queue / broker consumer
+
+Use the message or event ID from the broker payload.
+
+```ts
+import {
+  IdempotencyBuilder,
+  createIdempotentConsumer,
+} from "@xyph3r/idempotency";
+
+const idempotency = new IdempotencyBuilder()
+  .withMemoryStore()
+  .build();
+
+const handleOrderPaid = createIdempotentConsumer(
+  idempotency,
+  async (message: { eventId: string; orderId: string }) => {
+    await reserveInventory(message.orderId);
+    await createShipment(message.orderId);
+  },
+  {
+    key: (message) => message.eventId,
+  },
+);
+```
+
+Use this when:
+
+- the broker may redeliver after a worker crash
+- a webhook sender retries until it gets `2xx`
+- consumers trigger emails, charges, provisioning, or other side effects
+
+## Generic function wrapper
+
+If you do not want a framework adapter, wrap your function directly.
+
+```ts
+import {
+  IdempotencyBuilder,
+  createIdempotentHandler,
+} from "@xyph3r/idempotency";
+
+const idempotency = new IdempotencyBuilder()
+  .withMemoryStore()
+  .build();
+
+const createPayment = createIdempotentHandler(
+  idempotency,
+  async (context: {
+    body: unknown;
+    headers: Record<string, string | undefined>;
+  }) => {
+    return chargeCard(context.body);
+  },
+  {
+    key: (context) => context.headers["idempotency-key"],
+  },
+);
+```
+
+## Choosing the key
+
+A good key must be stable across retries for the same logical operation.
+
+Good keys:
+
+- client-provided `Idempotency-Key`
+- Stripe or GitHub webhook event ID
+- broker message ID or event ID
+- a server-generated operation ID returned earlier to the client
+
+Bad keys:
+
+- a random UUID generated inside the handler
+- current timestamp
+- request body hash if the same operation may legitimately repeat later
+
+## Runtime behavior
+
+By default:
+
+- only `POST`, `PATCH`, and `PUT` are protected by the HTTP adapters
+- duplicates wait briefly for the first execution to finish
+- completed results are replayed
+- failed executions are not stored as completed results
+
+Headers added to HTTP responses:
+
+- `idempotency-key`
+- `idempotency-status: created | cached`
+
+## Builder options
+
+```ts
+const idempotency = new IdempotencyBuilder()
+  .useStore(store)
+  .withTTL(24 * 60 * 60 * 1_000)
+  .withProcessingTTL(30_000)
+  .withPollInterval(50)
+  .withInFlightStrategy("wait")
+  .withDefaultHeader("idempotency-key")
+  .withKeyPrefix("payments")
+  .build();
+```
+
+Use `withInFlightStrategy("reject")` if you want duplicates to fail immediately while the first request is still running instead of waiting.
 
 ## Public API
 
